@@ -105,7 +105,7 @@ jobs:
           rm -rf artifacts/real_render_test
           python renderer/renderer_chromium.py payload.json --template renderer/templates/report_template.html --outdir artifacts/real_render_test
 
-      - name: Validate artifacts against V16 renderer contract
+      - name: Validate artifacts against current renderer manifest
         run: |
           python - <<'PY'
           import csv
@@ -118,10 +118,7 @@ jobs:
           manifest = json.loads((out / 'manifest.json').read_text(encoding='utf-8'))
           x_input = len(payload.get('playlistXTracks') or [])
           render = manifest.get('render') or {}
-          part_files = render.get('part_files') or []
-          part_row_counts = manifest.get('partRowCounts') or []
-          part_heights = manifest.get('partHeights') or []
-          part_size = manifest.get('partSize') or [1080, 1920]
+          parts = manifest.get('parts') or []
 
           assert payload.get('type') == 'real_render_test', 'Payload no normalizado a real_render_test'
           assert x_input > 0, 'No hay tracks de Playlist X en el payload'
@@ -129,39 +126,45 @@ jobs:
           assert int(manifest.get('officialRowsUsed', -1)) == x_input, 'officialRowsUsed no coincide'
           assert int(manifest.get('randomRowsUsed', -1)) == 0, 'Se detectaron filas random en renderer X-only'
           assert int(manifest.get('outputRows', -1)) == x_input, 'outputRows no coincide'
-          assert int(manifest.get('parts', -1)) == len(part_files), 'El número de partes no coincide con render.part_files'
-          assert len(part_files) > 0, 'El manifiesto no contiene archivos de partes'
-          assert len(part_row_counts) == len(part_files), 'partRowCounts no coincide con las partes'
-          assert len(part_heights) == len(part_files), 'partHeights no coincide con las partes'
-          assert sum(int(n) for n in part_row_counts) == x_input, 'Las partes no cubren todas las pistas de Playlist X'
+          assert isinstance(parts, list) and len(parts) > 0, 'manifest.parts debe ser una lista no vacía de objetos'
+          assert int(render.get('partsCount', -1)) == len(parts), 'render.partsCount no coincide con manifest.parts'
+          assert int(render.get('rowCount', -1)) == x_input, 'render.rowCount no coincide con las pistas'
 
-          expected_width = int(part_size[0])
-          full_height = int(part_size[1])
+          expected_width = int(render.get('outputWidthPx', 1080))
+          full_height = int(render.get('outputViewportHeightPx', 1920))
           cursor_row = 1
           checked_images = []
-          for index, filename_value in enumerate(part_files):
-              filename = str(filename_value).strip()
-              assert filename, f'La parte {index + 1} no tiene nombre de archivo'
+          for index, part in enumerate(parts):
+              filename = str(part.get('fileName') or '').strip()
+              assert filename, f'La parte {index + 1} no tiene fileName'
+              row_count = int(part.get('rowCount', 0))
+              start_row = int(part.get('startRow', 0))
+              end_row = int(part.get('endRow', 0))
+              assert row_count > 0, f'{filename}: rowCount no válido'
+              assert start_row == cursor_row, f'{filename}: startRow no contiguo; esperado {cursor_row}, recibido {start_row}'
+              assert end_row == start_row + row_count - 1, f'{filename}: endRow/rowCount inconsistente'
               image_path = out / filename
               assert image_path.is_file(), f'Falta la imagen {filename}'
               with Image.open(image_path) as source_image:
                   image = source_image.convert('RGB')
                   assert image.width == expected_width, f'{filename}: ancho {image.width}; esperado {expected_width}'
-                  assert image.height == int(part_heights[index]), f'{filename}: la altura no coincide con partHeights'
+                  assert image.width == int(part.get('width', -1)), f'{filename}: ancho distinto al manifiesto'
+                  assert image.height == int(part.get('height', -1)), f'{filename}: alto distinto al manifiesto'
                   assert 1 <= image.height <= full_height, f'{filename}: altura no válida {image.height}'
-                  if index < len(part_files) - 1:
+                  if index < len(parts) - 1:
                       assert image.height == full_height, f'{filename}: una parte no final debe medir {full_height}px de alto'
                   assert ImageChops.difference(image, Image.new('RGB', image.size, 'white')).getbbox() is not None, f'{filename} está totalmente en blanco'
-                  checked_images.append((filename, image.width, image.height, int(part_row_counts[index])))
-              cursor_row += int(part_row_counts[index])
+                  checked_images.append((filename, image.width, image.height, row_count))
+              cursor_row = end_row + 1
 
+          assert cursor_row - 1 == x_input, 'Las partes no cubren todas las pistas de Playlist X'
           with (out / 'history_real.csv').open(encoding='utf-8', newline='') as handle:
               csv_rows = list(csv.DictReader(handle))
           assert len(csv_rows) == x_input, f'CSV contiene {len(csv_rows)} filas; se esperaban {x_input}'
           assert all(row.get('origen') == 'playlist_x' for row in csv_rows), 'El CSV contiene filas que no son de Playlist X'
-          assert all(str(row.get('image_url', '')).strip() for row in csv_rows), 'Hay tracks sin portada individual en el CSV'
+          assert all(str(row.get('cover_url', '')).strip() for row in csv_rows), 'Hay tracks sin portada individual en el CSV'
 
-          print('V16 RENDERER CONTRACT OK')
+          print('CURRENT RENDERER MANIFEST CONTRACT OK')
           print('Playlist X rows:', x_input)
           print('Parts:', checked_images)
           print('CSV rows:', len(csv_rows))
@@ -190,6 +193,7 @@ jobs:
           import urllib.parse
           import urllib.request
           from pathlib import Path
+          from PIL import Image
 
           payload = json.loads(Path('payload.json').read_text(encoding='utf-8'))
           out = Path('artifacts/real_render_test')
@@ -205,45 +209,46 @@ jobs:
           with (out / 'history_real.csv').open(encoding='utf-8', newline='') as f:
               rows = list(csv.DictReader(f))
 
+          parts = manifest.get('parts') or []
+          if not isinstance(parts, list) or not parts:
+              raise SystemExit('manifest.parts no contiene una lista de imágenes')
           render = manifest.get('render') or {}
-          part_files = render.get('part_files') or []
-          part_row_counts = manifest.get('partRowCounts') or []
-          part_heights = manifest.get('partHeights') or []
-          if not part_files:
-              raise SystemExit('El manifiesto no contiene render.part_files')
-          if len(part_row_counts) != len(part_files) or len(part_heights) != len(part_files):
-              raise SystemExit('Metadatos de partes incompletos en manifest.json')
+          if int(render.get('partsCount', -1)) != len(parts):
+              raise SystemExit('render.partsCount no coincide con manifest.parts')
 
           image_parts = []
-          start_row = 1
-          for index, filename_value in enumerate(part_files):
-              filename = str(filename_value).strip()
+          expected_start_row = 1
+          for index, part in enumerate(parts):
+              filename = str(part.get('fileName') or '').strip()
               image_path = out / filename
               if not filename or not image_path.is_file():
-                  raise SystemExit(f'No existe el PNG listado por el manifiesto: {filename}')
-              from PIL import Image
+                  raise SystemExit(f'No existe el PNG listado por manifest.parts: {filename}')
+              row_count = int(part.get('rowCount', 0))
+              start_row = int(part.get('startRow', 0))
+              end_row = int(part.get('endRow', 0))
+              if row_count < 1 or start_row != expected_start_row or end_row != start_row + row_count - 1:
+                  raise SystemExit(f'Metadatos startRow/endRow/rowCount inconsistentes para {filename}')
               with Image.open(image_path) as img:
                   width, height = img.size
-              row_count = int(part_row_counts[index])
-              if row_count < 1:
-                  raise SystemExit(f'La parte {index + 1} tiene rowCount no válido: {row_count}')
-              end_row = start_row + row_count - 1
+              if width != int(part.get('width', -1)) or height != int(part.get('height', -1)):
+                  raise SystemExit(f'El tamaño de {filename} no coincide con manifest.parts')
+
               image_parts.append({
-                  'partNumber': index + 1,
+                  'partNumber': int(part.get('partNumber', index + 1)),
                   'fileName': filename,
                   'mimeType': 'image/png',
                   'imageBase64': base64.b64encode(image_path.read_bytes()).decode('ascii'),
                   'width': int(width),
                   'height': int(height),
-                  'startRow': int(start_row),
-                  'endRow': int(end_row),
-                  'rowCount': int(row_count),
-                  'isFinalPart': index == len(part_files) - 1,
+                  'startRow': start_row,
+                  'endRow': end_row,
+                  'rowCount': row_count,
+                  'isFinalPart': bool(part.get('isFinalPart', index == len(parts) - 1)),
               })
-              start_row = end_row + 1
+              expected_start_row = end_row + 1
 
-          if not image_parts:
-              raise SystemExit('No hay imágenes para enviar al callback')
+          if expected_start_row - 1 != len(rows):
+              raise SystemExit(f'Las partes cubren {expected_start_row - 1} filas, CSV tiene {len(rows)}')
 
           report_payload = {
               'type': 'report_result',
