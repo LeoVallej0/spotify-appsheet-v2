@@ -118,9 +118,19 @@ jobs:
           manifest = json.loads((out / 'manifest.json').read_text(encoding='utf-8'))
           x_input = len(payload.get('playlistXTracks') or [])
           render = manifest.get('render') or {}
-          part_files = render.get('part_files') or []
-          part_row_counts = manifest.get('partRowCounts') or []
-          part_heights = manifest.get('partHeights') or []
+          # Contrato REAL V16: manifest.parts y render.parts son listas de objetos,
+          # render.parts_count es el contador y render.part_files contiene los nombres de PNG.
+          manifest_parts = manifest.get('parts') or []
+          render_parts = render.get('parts') or []
+          part_files = render.get('part_files') or [
+              item.get('fileName') for item in manifest_parts if isinstance(item, dict)
+          ]
+          part_row_counts = manifest.get('partRowCounts') or [
+              item.get('rowCount') for item in manifest_parts if isinstance(item, dict)
+          ]
+          part_heights = manifest.get('partHeights') or [
+              item.get('height') for item in manifest_parts if isinstance(item, dict)
+          ]
           part_size = manifest.get('partSize') or [1080, 1920]
 
           assert payload.get('type') == 'real_render_test', 'Payload no normalizado a real_render_test'
@@ -129,11 +139,18 @@ jobs:
           assert int(manifest.get('officialRowsUsed', -1)) == x_input, 'officialRowsUsed no coincide'
           assert int(manifest.get('randomRowsUsed', -1)) == 0, 'Se detectaron filas random en renderer X-only'
           assert int(manifest.get('outputRows', -1)) == x_input, 'outputRows no coincide'
+          assert isinstance(manifest_parts, list) and len(manifest_parts) > 0, 'manifest.parts debe ser una lista no vacía'
+          assert isinstance(render_parts, list) and len(render_parts) > 0, 'render.parts debe ser una lista no vacía'
           assert isinstance(part_files, list) and len(part_files) > 0, 'render.part_files debe ser una lista no vacía'
-          # En V16, manifest.parts y render.parts son NÚMEROS; las rutas están en render.part_files.
-          assert int(manifest.get('parts', -1)) == len(part_files), 'manifest.parts no coincide con render.part_files'
-          assert int(render.get('parts', -1)) == len(part_files), 'render.parts no coincide con render.part_files'
+          assert len(manifest_parts) == len(part_files), 'manifest.parts no coincide con render.part_files'
+          assert len(render_parts) == len(part_files), 'render.parts no coincide con render.part_files'
+          assert int(render.get('parts_count', -1)) == len(part_files), 'render.parts_count no coincide con render.part_files'
           assert len(part_row_counts) == len(part_files), 'partRowCounts no coincide con render.part_files'
+          assert len(part_heights) == len(part_files), 'partHeights no coincide con render.part_files'
+          for index, part in enumerate(manifest_parts):
+              assert str(part.get('fileName', '')).strip() == str(part_files[index]).strip(), f'Nombre inconsistente en manifest.parts[{index}]'
+              assert int(part.get('rowCount', -1)) == int(part_row_counts[index]), f'rowCount inconsistente en parte {index + 1}'
+              assert int(part.get('height', -1)) == int(part_heights[index]), f'height inconsistente en parte {index + 1}'
           assert len(part_heights) == len(part_files), 'partHeights no coincide con render.part_files'
           assert sum(int(n) for n in part_row_counts) == x_input, 'Las partes no cubren todas las pistas de Playlist X'
 
@@ -211,21 +228,39 @@ jobs:
           with (out / 'history_real.csv').open(encoding='utf-8', newline='') as f:
               rows = list(csv.DictReader(f))
 
-          # Contrato real del renderer V16: manifest.parts es el contador;
-          # los nombres de archivo están en manifest.render.part_files.
+          # Contrato REAL V16: manifest.parts/render.parts son listas; parts_count es el contador.
           render = manifest.get('render') or {}
-          part_files = render.get('part_files') or []
-          part_row_counts = manifest.get('partRowCounts') or []
-          part_heights = manifest.get('partHeights') or []
+          manifest_parts = manifest.get('parts') or []
+          render_parts = render.get('parts') or []
+          part_files = render.get('part_files') or [
+              item.get('fileName') for item in manifest_parts if isinstance(item, dict)
+          ]
+          part_row_counts = manifest.get('partRowCounts') or [
+              item.get('rowCount') for item in manifest_parts if isinstance(item, dict)
+          ]
+          part_heights = manifest.get('partHeights') or [
+              item.get('height') for item in manifest_parts if isinstance(item, dict)
+          ]
           part_size = manifest.get('partSize') or [1080, 1920]
+          if not isinstance(manifest_parts, list) or not manifest_parts:
+              raise SystemExit('manifest.parts no contiene los objetos de las imágenes')
+          if not isinstance(render_parts, list) or not render_parts:
+              raise SystemExit('manifest.render.parts no contiene los objetos de las imágenes')
           if not isinstance(part_files, list) or not part_files:
               raise SystemExit('manifest.render.part_files no contiene una lista de imágenes')
-          if int(manifest.get('parts', -1)) != len(part_files):
-              raise SystemExit('manifest.parts no coincide con render.part_files')
-          if int(render.get('parts', -1)) != len(part_files):
-              raise SystemExit('render.parts no coincide con render.part_files')
+          if len(manifest_parts) != len(part_files) or len(render_parts) != len(part_files):
+              raise SystemExit('Las listas parts no coinciden con render.part_files')
+          if int(render.get('parts_count', -1)) != len(part_files):
+              raise SystemExit('render.parts_count no coincide con render.part_files')
           if len(part_row_counts) != len(part_files) or len(part_heights) != len(part_files):
               raise SystemExit('partRowCounts/partHeights no coincide con render.part_files')
+          for index, part in enumerate(manifest_parts):
+              if str(part.get('fileName', '')).strip() != str(part_files[index]).strip():
+                  raise SystemExit(f'Nombre inconsistente en parte {index + 1}')
+              if int(part.get('rowCount', -1)) != int(part_row_counts[index]):
+                  raise SystemExit(f'rowCount inconsistente en parte {index + 1}')
+              if int(part.get('height', -1)) != int(part_heights[index]):
+                  raise SystemExit(f'height inconsistente en parte {index + 1}')
 
           image_parts = []
           expected_start_row = 1
