@@ -1,3 +1,195 @@
+name: Render Spotify Reports
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types:
+      - render_real_test
+      - render_scheduled
+      - render_manual_test
+
+permissions:
+  contents: read
+
+jobs:
+  renderer-test:
+    name: Chromium X-only dynamic mobile renderer
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: renderer/requirements.txt
+
+      - name: Install Python packages
+        run: python -m pip install -r renderer/requirements.txt
+
+      # Install the browser even when the actions/cache step is restored.
+      # This repairs stale/incomplete Playwright browser caches.
+      - name: Install Chromium and system dependencies
+        run: python -m playwright install --with-deps chromium
+
+      - name: Verify Playwright Chromium
+        run: |
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              browser = p.chromium.launch(
+                  headless=True,
+                  args=['--no-sandbox', '--disable-dev-shm-usage']
+              )
+              browser.close()
+          print('PLAYWRIGHT CHROMIUM OK')
+          PY
+
+      - name: Prepare payload
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PAYLOAD_JSON: ${{ toJson(github.event.client_payload) }}
+        run: |
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            printf '%s' "$PAYLOAD_JSON" > payload.json
+          else
+            python renderer/create_fixture.py
+            mv fixture_payload.json payload.json
+          fi
+
+          python - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          path = Path('payload.json')
+          p = json.loads(path.read_text(encoding='utf-8'))
+          original_type = str(p.get('type', '') or '')
+
+          # The Apps Script connectivity-only event has no report rows.
+          # Render a local fixture for that test, but do not call Apps Script back.
+          if original_type == 'integration_test' and not p.get('playlistXTracks'):
+              subprocess.run(['python', 'renderer/create_fixture.py'], check=True)
+              p = json.loads(Path('fixture_payload.json').read_text(encoding='utf-8'))
+              p['generationMode'] = 'integration_test'
+
+          tracks = p.get('playlistXTracks') or []
+          if not tracks:
+              raise SystemExit('payload.json no contiene playlistXTracks')
+          if p.get('fillerTracks'):
+              raise SystemExit('Este renderer es X-only y no admite fillerTracks')
+
+          # El renderer que existe en este repositorio exige exactamente
+          # type=real_render_test. El modo real (manual/automatico) se conserva
+          # aparte en generationMode y se usa para el callback de Apps Script.
+          p['type'] = 'real_render_test'
+
+          path.write_text(json.dumps(p, ensure_ascii=False, separators=(',', ':')), encoding='utf-8')
+          print('original payload type:', original_type)
+          print('renderer payload type:', p.get('type'))
+          print('generationMode:', p.get('generationMode', ''))
+          print('recordId:', p.get('recordId', ''))
+          print('reportId:', p.get('reportId', ''))
+          print('idAgenda:', p.get('idAgenda', ''))
+          print('Playlist X tracks:', len(tracks))
+          print('referenceTime:', p.get('referenceTime', ''))
+          PY
+          python -m json.tool payload.json >/dev/null
+
+      - name: Run Chromium renderer
+        run: |
+          rm -rf artifacts/real_render_test
+          python renderer/renderer_chromium.py payload.json --template renderer/templates/report_template.html --outdir artifacts/real_render_test
+
+      - name: Validate artifacts against V16 renderer manifest
+        run: |
+          python - <<'PY'
+          import csv
+          import json
+          from pathlib import Path
+          from PIL import Image, ImageChops
+
+          out = Path('artifacts/real_render_test')
+          payload = json.loads(Path('payload.json').read_text(encoding='utf-8'))
+          manifest = json.loads((out / 'manifest.json').read_text(encoding='utf-8'))
+          x_input = len(payload.get('playlistXTracks') or [])
+          render = manifest.get('render') or {}
+          part_files = render.get('part_files') or []
+          part_row_counts = manifest.get('partRowCounts') or []
+          part_heights = manifest.get('partHeights') or []
+          part_size = manifest.get('partSize') or [1080, 1920]
+
+          assert payload.get('type') == 'real_render_test', 'Payload no normalizado a real_render_test'
+          assert x_input > 0, 'No hay tracks de Playlist X en el payload'
+          assert int(manifest.get('playlistXInputRows', -1)) == x_input, 'playlistXInputRows no coincide'
+          assert int(manifest.get('officialRowsUsed', -1)) == x_input, 'officialRowsUsed no coincide'
+          assert int(manifest.get('randomRowsUsed', -1)) == 0, 'Se detectaron filas random en renderer X-only'
+          assert int(manifest.get('outputRows', -1)) == x_input, 'outputRows no coincide'
+          assert isinstance(part_files, list) and len(part_files) > 0, 'render.part_files debe ser una lista no vacía'
+          # En V16, manifest.parts y render.parts son NÚMEROS; las rutas están en render.part_files.
+          assert int(manifest.get('parts', -1)) == len(part_files), 'manifest.parts no coincide con render.part_files'
+          assert int(render.get('parts', -1)) == len(part_files), 'render.parts no coincide con render.part_files'
+          assert len(part_row_counts) == len(part_files), 'partRowCounts no coincide con render.part_files'
+          assert len(part_heights) == len(part_files), 'partHeights no coincide con render.part_files'
+          assert sum(int(n) for n in part_row_counts) == x_input, 'Las partes no cubren todas las pistas de Playlist X'
+
+          expected_width = int(part_size[0])
+          full_height = int(part_size[1])
+          cursor_row = 1
+          checked_images = []
+          for index, filename_value in enumerate(part_files):
+              filename = str(filename_value).strip()
+              assert filename, f'La parte {index + 1} no tiene nombre de archivo'
+              row_count = int(part_row_counts[index])
+              expected_height = int(part_heights[index])
+              assert row_count > 0, f'{filename}: rowCount no válido'
+              image_path = out / filename
+              assert image_path.is_file(), f'Falta la imagen {filename}'
+              with Image.open(image_path) as source_image:
+                  image = source_image.convert('RGB')
+                  assert image.width == expected_width, f'{filename}: ancho {image.width}; esperado {expected_width}'
+                  assert image.height == expected_height, f'{filename}: alto {image.height}; esperado {expected_height}'
+                  assert 1 <= image.height <= full_height, f'{filename}: alto no válido {image.height}'
+                  if index < len(part_files) - 1:
+                      assert image.height == full_height, f'{filename}: una parte no final debe medir {full_height}px de alto'
+                  assert ImageChops.difference(image, Image.new('RGB', image.size, 'white')).getbbox() is not None, f'{filename} está totalmente en blanco'
+                  checked_images.append((filename, image.width, image.height, row_count))
+              cursor_row += row_count
+
+          assert cursor_row - 1 == x_input, 'Las partes no cubren todas las pistas de Playlist X'
+          with (out / 'history_real.csv').open(encoding='utf-8', newline='') as handle:
+              csv_rows = list(csv.DictReader(handle))
+          assert len(csv_rows) == x_input, f'CSV contiene {len(csv_rows)} filas; se esperaban {x_input}'
+          assert all(row.get('origen') == 'playlist_x' for row in csv_rows), 'El CSV contiene filas que no son de Playlist X'
+          assert all(str(row.get('image_url', '')).strip() for row in csv_rows), 'Hay tracks sin portada individual en el CSV'
+
+          print('V16 RENDERER MANIFEST CONTRACT OK')
+          print('Playlist X rows:', x_input)
+          print('Parts:', checked_images)
+          print('CSV rows:', len(csv_rows))
+          print('Random rows:', manifest.get('randomRowsUsed'))
+          PY
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: spotify-renderer-current-format
+          path: artifacts/real_render_test
+          if-no-files-found: error
+          retention-days: 7
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Send all rendered PNG parts to Apps Script
+        if: ${{ github.event_name == 'repository_dispatch' && github.event.action != 'render_manual_test' && github.event.client_payload.callbackUrl != '' }}
+        env:
+          CALLBACK_SECRET: ${{ secrets.RENDER_CALLBACK_SECRET }}
+        run: |
+          python - <<'PY'
+          import base64
+          import csv
           import json
           import os
           import urllib.parse
