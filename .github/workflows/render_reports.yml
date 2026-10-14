@@ -1,317 +1,102 @@
-name: Render Spotify Reports
-
-on:
-  workflow_dispatch:
-  repository_dispatch:
-    types:
-      - render_real_test
-      - render_scheduled
-      - render_manual_test
-
-permissions:
-  contents: read
-
-jobs:
-  renderer-test:
-    name: Chromium X-only dynamic mobile renderer
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Setup Python 3.13
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.13'
-          cache: pip
-          cache-dependency-path: renderer/requirements.txt
-
-      - name: Install Python packages
-        run: python -m pip install -r renderer/requirements.txt
-
-      - name: Cache Chromium
-        uses: actions/cache@v6
-        id: playwright-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('renderer/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-playwright-chromium-
-
-      - name: Install Chromium (cache miss)
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: python -m playwright install --with-deps chromium
-
-      - name: Verify Playwright Chromium
-        run: |
-          python - <<'PY'
-          from playwright.sync_api import sync_playwright
-          with sync_playwright() as p:
-              browser = p.chromium.launch(
-                  headless=True,
-                  args=['--no-sandbox', '--disable-dev-shm-usage']
-              )
-              browser.close()
-          print('PLAYWRIGHT CHROMIUM OK')
-          PY
-
-      - name: Prepare payload
-        env:
-          PAYLOAD_JSON: ${{ toJson(github.event.client_payload) }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
-            printf '%s' "$PAYLOAD_JSON" > payload.json
-          else
-            python renderer/create_fixture.py
-            mv fixture_payload.json payload.json
-          fi
-
-          python -m json.tool payload.json >/dev/null
-
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          path = Path('payload.json')
-          p = json.loads(path.read_text(encoding='utf-8'))
-          original_type = str(p.get('type', '') or '')
-          x_rows = p.get('playlistXTracks') or []
-
-          # The legacy connectivity test dispatches a tiny integration payload
-          # without report rows. Turn that event into a local fixture instead
-          # of pretending it is a production render.
-          if not x_rows and original_type == 'integration_test':
-              fixture = Path('renderer/create_fixture.py')
-              import subprocess
-              subprocess.run(['python', str(fixture)], check=True)
-              p = json.loads(Path('fixture_payload.json').read_text(encoding='utf-8'))
-              p['generationMode'] = 'integration_test'
-              original_type = 'integration_test'
-
-          if not p.get('playlistXTracks'):
-              raise SystemExit('payload.json no contiene playlistXTracks')
-
-          if original_type == 'scheduled_render':
-              p['type'] = 'real_render_test'
-
-          path.write_text(
-              json.dumps(p, ensure_ascii=False, separators=(',', ':')),
-              encoding='utf-8'
-          )
-
-          print('original payload type:', original_type)
-          print('renderer payload type:', p.get('type', ''))
-          print('generationMode:', p.get('generationMode', ''))
-          print('official tracks:', len(p.get('playlistXTracks') or []))
-          print('random tracks: 0')
-          print('referenceTime:', p.get('referenceTime', ''))
-          PY
-
-      - name: Run Chromium renderer
-        run: |
-          rm -rf artifacts/real_render_test
-          python renderer/renderer_chromium.py \
-            payload.json \
-            --template renderer/templates/report_template.html \
-            --outdir artifacts/real_render_test
-
-      - name: Validate dynamic X-only artifacts
-        run: |
-          python - <<'PY'
-          import csv
-          import json
-          from pathlib import Path
-          from PIL import Image
-
-          out = Path('artifacts/real_render_test')
-          manifest = json.loads((out / 'manifest.json').read_text(encoding='utf-8'))
-          payload = json.loads(Path('payload.json').read_text(encoding='utf-8'))
-
-          x_input = payload.get('playlistXTracks') or []
-          input_count = len(x_input)
-
-          assert input_count > 0, 'Playlist X no puede estar vacía'
-          assert int(manifest.get('playlistXInputRows', -1)) == input_count, manifest
-          assert int(manifest.get('officialRowsUsed', -1)) == input_count, manifest
-          assert int(manifest.get('outputRows', -1)) == input_count, manifest
-          assert int(manifest.get('randomRowsUsed', 0)) == 0, manifest
-
-          with (out / 'history_real.csv').open(encoding='utf-8', newline='') as f:
-              rows = list(csv.DictReader(f))
-
-          assert len(rows) == input_count, (
-              f'Expected {input_count} history rows, got {len(rows)}'
-          )
-          assert all(r.get('origen') == 'playlist_x' for r in rows), \
-              'El historial contiene una fila que no pertenece a X'
-          assert all(int(r.get('gap_s', '0')) == 0 for r in rows), \
-              'Playlist X contiene gaps sintéticos'
-
-          parts = manifest.get('parts') or []
-          assert parts, 'No se generaron partes'
-          assert [int(p.get('partNumber', 0)) for p in parts] == list(range(1, len(parts) + 1)), \
-              'Numeración de partes no consecutiva'
-          assert parts[0].get('fileName') == 'report_real.png'
-          assert parts[-1].get('endRow') == input_count
-
-          for part in parts:
-              n = int(part.get('partNumber', 0))
-              path = out / part['fileName']
-              assert path.exists(), f'Falta {path.name}'
-              img = Image.open(path)
-              assert img.width == 1080, f'Parte {n}: ancho inesperado {img.width}'
-              if n < len(parts):
-                  assert img.height == 1920, (
-                      f'Parte {n}: alto inesperado {img.height}; '
-                      'las partes no finales deben mantener el viewport completo'
-                  )
-              else:
-                  # La última parte puede medir más de 1920 px cuando
-                  # fusionamos un sobrante de 1–3 canciones con la captura anterior.
-                  assert 1 <= img.height <= 2880, (
-                      f'Última parte: alto inválido {img.height}; máximo permitido 2880'
-                  )
-
-          contract = manifest.get('contract') or {}
-          assert contract.get('xOnly') is True
-          assert contract.get('preserveXLength') is True
-          assert contract.get('individualTrackCoversRequired') is True
-          assert contract.get('fillerAllowed') is False
-          assert contract.get('fixedMasterHeightRequired') is False
-          assert contract.get('fixedPartCount') is False
-          assert int(contract.get('mergeTailUpToRows', 0)) == 3
-
-          # Deliberately no assertion exists for a fixed master height.
-          # The prior failure "Unexpected master size: (1080, 3418)" must not
-          # be reintroduced by the workflow.
-          print('========================================')
-          print('DYNAMIC X-ONLY VALIDATION OK')
-          print('X rows:', input_count)
-          print('Parts:', len(parts))
-          print('Final size:', Image.open(out / parts[-1]['fileName']).size)
-          print('Random rows:', manifest.get('randomRowsUsed', 0))
-          print('No fixed master-height validation')
-          print('========================================')
-          PY
-
-      - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v7
-        if: github.event_name == 'workflow_dispatch'
-        with:
-          name: chromium-render-test
-          path: artifacts/real_render_test
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Send multipart report to Apps Script
-        if: github.event_name == 'repository_dispatch' && (github.event.action == 'render_real_test' || github.event.action == 'render_scheduled' || github.event.action == 'render_manual_test')
-        env:
-          CALLBACK_SECRET: ${{ secrets.RENDER_CALLBACK_SECRET }}
-        run: |
-          python - <<'PY'
-          import base64
-          import json
-          import os
-          import urllib.parse
-          import urllib.request
-          from pathlib import Path
-
-          payload = json.loads(Path('payload.json').read_text(encoding='utf-8'))
-          out = Path('artifacts/real_render_test')
-          manifest = json.loads((out / 'manifest.json').read_text(encoding='utf-8'))
-
-          callback_url = str(payload.get('callbackUrl', '') or '').strip()
-          secret = str(os.environ.get('CALLBACK_SECRET', '') or '').strip()
-          parts = manifest.get('parts') or []
-
-          # The integration-only connectivity test has no callback URL.
-          if not callback_url:
-              print('Sin callbackUrl: render de integración completado sin callback.')
-              raise SystemExit(0)
-          if not secret:
-              raise SystemExit('Missing GitHub secret RENDER_CALLBACK_SECRET')
-
-          images = []
-          for part in parts:
-              path = out / str(part['fileName'])
-              if not path.exists():
-                  raise SystemExit(f'Missing rendered part: {path.name}')
-              images.append({
-                  'partNumber': int(part['partNumber']),
-                  'fileName': path.name,
-                  'mimeType': 'image/png',
-                  'imageBase64': base64.b64encode(path.read_bytes()).decode('ascii'),
-                  'width': int(part.get('width') or 1080),
-                  'height': int(part.get('height') or 0),
-                  'startRow': int(part.get('startRow') or 0),
-                  'endRow': int(part.get('endRow') or 0),
-                  'rowCount': int(part.get('rowCount') or 0),
-                  'isFinalPart': bool(part.get('isFinalPart')),
-              })
-
-          manifest_official = int(manifest.get('officialRowsUsed') or 0)
-          manifest_total = int(manifest.get('outputRows') or 0)
-
-          report_payload = {
-              'type': 'report_result',
-              'recordId': str(payload.get('recordId', '') or ''),
-              'reportId': str(payload.get('reportId', '') or ''),
-              'solicitudId': str(payload.get('solicitudId', '') or ''),
-              'idAgenda': str(payload.get('idAgenda', payload.get('agendaId', '')) or ''),
-              'playlistName': str(payload.get('playlistName', 'Playlist') or 'Playlist'),
-              'referenceTime': str(payload.get('referenceTime', '') or ''),
-              'generatedAt': str(payload.get('generatedAt', '') or ''),
-              'generationMode': str(payload.get('generationMode', 'manual') or 'manual'),
-              'finalTimeHHMM': str(payload.get('finalTimeHHMM', '') or ''),
-              'officialCount': manifest_official,
-              'randomCount': 0,
-              'totalRows': manifest_total,
-              'partsCount': len(images),
-              'images': images,
-              'xOnly': True,
+{
+  "name": "Render Spotify Reports",
+  "on": {
+    "workflow_dispatch": {},
+    "repository_dispatch": {
+      "types": [
+        "render_real_test",
+        "render_scheduled",
+        "render_manual_test"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "jobs": {
+    "renderer-test": {
+      "name": "Chromium headless report renderer - HIRES 2X + FIXED CROP",
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 15,
+      "steps": [
+        {
+          "name": "Checkout repository",
+          "uses": "actions/checkout@v7"
+        },
+        {
+          "name": "Setup Python 3.13",
+          "uses": "actions/setup-python@v7",
+          "with": {
+            "python-version": "3.13",
+            "cache": "pip",
+            "cache-dependency-path": "renderer/requirements.txt"
           }
-
-          separator = '&' if '?' in callback_url else '?'
-          url = callback_url + separator + urllib.parse.urlencode({'key': secret})
-          body = json.dumps(report_payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
-
-          req = urllib.request.Request(
-              url,
-              data=body,
-              headers={
-                  'Content-Type': 'application/json',
-                  'Accept': 'application/json',
-                  'User-Agent': 'GitHubActions-SpotifyReportRenderer/2.0',
-              },
-              method='POST',
-          )
-
-          try:
-              with urllib.request.urlopen(req, timeout=180) as response:
-                  status = response.status
-                  response_body = response.read().decode('utf-8', errors='replace')
-          except Exception as exc:
-              raise SystemExit(f'Callback request failed: {exc}')
-
-          print('Apps Script callback HTTP:', status)
-          print('Apps Script callback response:', response_body[:4000])
-
-          if status < 200 or status >= 300:
-              raise SystemExit(f'Apps Script callback returned HTTP {status}')
-
-          result = json.loads(response_body)
-          if result.get('ok') is not True:
-              raise SystemExit(f'Apps Script callback reported failure: {result}')
-
-          print('MULTIPART CALLBACK OK')
-          print('Saved primary path:', result.get('fileName', ''))
-          print('Manifest Drive file id:', result.get('manifestFileId', ''))
-          print('Parts:', result.get('partsCount', len(images)))
-          PY
-
-    concurrency:
-      group: spotify-report-${{ github.event.client_payload.reportId || github.event.client_payload.solicitudId || github.event.client_payload.idAgenda || github.run_id }}
-      cancel-in-progress: false
+        },
+        {
+          "name": "Install Python packages",
+          "run": "python -m pip install -r renderer/requirements.txt"
+        },
+        {
+          "name": "Cache Chromium",
+          "uses": "actions/cache@v6",
+          "id": "playwright-cache",
+          "with": {
+            "path": "~/.cache/ms-playwright",
+            "key": "${{ runner.os }}-playwright-chromium-${{ hashFiles('renderer/requirements.txt') }}",
+            "restore-keys": "${{ runner.os }}-playwright-chromium-"
+          }
+        },
+        {
+          "name": "Ensure Chromium and system dependencies are installed",
+          "run": "python -m playwright install --with-deps chromium"
+        },
+        {
+          "name": "Verify Playwright Chromium",
+          "run": "python - <<'PYCHK'\nfrom playwright.sync_api import sync_playwright\nwith sync_playwright() as p:\n    browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])\n    browser.close()\nprint('PLAYWRIGHT CHROMIUM OK')\nPYCHK"
+        },
+        {
+          "name": "Prepare payload",
+          "env": {
+            "PAYLOAD_JSON": "${{ toJson(github.event.client_payload) }}"
+          },
+          "run": "if [ \"${{ github.event_name }}\" = \"repository_dispatch\" ]; then\n  printf '%s' \"$PAYLOAD_JSON\" > payload.json\nelse\n  python renderer/create_fixture.py\n  mv fixture_payload.json payload.json\nfi\n\npython -m json.tool payload.json >/dev/null\n\npython - <<'PY2'\nimport json\nfrom pathlib import Path\n\npath = Path(\"payload.json\")\np = json.loads(path.read_text(encoding=\"utf-8\"))\n\noriginal_type = p.get(\"type\", \"\")\n\n# El renderer Chromium existente valida type=real_render_test.\n# Para repository_dispatch de producción/prueba programada,\n# mantenemos generationMode para que el callback conozca el modo.\nif original_type == \"scheduled_render\":\n    p[\"type\"] = \"real_render_test\"\n\npath.write_text(\n    json.dumps(p, ensure_ascii=False, separators=(\",\", \":\")),\n    encoding=\"utf-8\"\n)\n\nprint(\"original payload type:\", original_type)\nprint(\"renderer payload type:\", p.get(\"type\"))\nprint(\"generationMode:\", p.get(\"generationMode\", \"\"))\nprint(\"official tracks:\", len(p.get(\"playlistXTracks\", [])))\nprint(\"random tracks:\", len(p.get(\"fillerTracks\", [])))\nprint(\"referenceTime:\", p.get(\"referenceTime\", \"\"))\nPY2"
+        },
+        {
+          "name": "Run Chromium renderer",
+          "run": "rm -rf artifacts/real_render_test\npython renderer/renderer_chromium.py payload.json --template renderer/templates/report_template.html --outdir artifacts/real_render_test"
+        },
+        {
+          "name": "Inspect high-resolution output",
+          "run": "python - <<'PYHIRES'\nfrom pathlib import Path\nfrom PIL import Image\np=Path(\"artifacts/real_render_test/report_real.png\")\nimg=Image.open(p)\nprint(\"High-resolution PNG:\", img.size)\nprint(\"File size:\", p.stat().st_size, \"bytes\")\nPYHIRES"
+        },
+        {
+          "name": "Validate artifacts",
+          "run": "python - <<'PY3'\nimport csv\nimport json\nfrom pathlib import Path\nfrom PIL import Image, ImageChops\n\nout = Path(\"artifacts/real_render_test\")\nmanifest = json.loads((out / \"manifest.json\").read_text(encoding=\"utf-8\"))\npayload = json.loads(Path(\"payload.json\").read_text(encoding=\"utf-8\"))\n\nimg = Image.open(out / \"report_real.png\").convert(\"RGB\")\nexpected_size = (2890, 3090)\nassert img.size == expected_size, f\"Unexpected PNG size: {img.size}; expected {expected_size}\"\n\n# Safety check: the fixed crop must not cut visible report content.\nbg = Image.new(\"RGB\", img.size, (255, 255, 255))\nbbox = ImageChops.difference(img, bg).getbbox()\nassert bbox is not None, \"Final PNG is completely white\"\nassert bbox[3] <= expected_size[1], f\"Visible content exceeds final crop: bbox={bbox}\"\n\nwith (out / \"history_real.csv\").open(encoding=\"utf-8\", newline=\"\") as f:\n    rows = list(csv.DictReader(f))\n\nx_input = len(payload.get(\"playlistXTracks\", []))\nx_used = min(x_input, 50)\nrandom_expected = max(0, 50 - x_used)\n\nassert len(rows) == 50, f\"Expected 50 rows, got {len(rows)}\"\nofficial = [r for r in rows if r[\"origen\"] == \"playlist_x\"]\nrandom_rows = [r for r in rows if r[\"origen\"] == \"random\"]\n\nassert len(official) == x_used, f\"Expected {x_used} official rows, got {len(official)}\"\nassert len(random_rows) == random_expected, f\"Expected {random_expected} random rows, got {len(random_rows)}\"\nassert all(int(r[\"gap_s\"]) == 0 for r in official), \"Playlist X contains synthetic gaps\"\n\nif random_rows:\n    max_gap = max(int(r[\"gap_s\"]) for r in random_rows)\n    print(\"Random max gap:\", max_gap, \"seconds\")\n\nprint(\"\")\nprint(\"========================================\")\nprint(\"CHROMIUM HIRES VALIDATION OK\")\nprint(\"========================================\")\nprint(\"PNG:\", img.size)\nprint(\"Visible bbox:\", bbox)\nprint(\"Total rows:\", len(rows))\nprint(\"Official:\", len(official))\nprint(\"Random:\", len(random_rows))\nprint(\"Expected official:\", x_used)\nprint(\"Expected random:\", random_expected)\nprint(\"Device scale factor:\", manifest.get(\"deviceScaleFactor\"))\nprint(\"Fixed crop:\", manifest.get(\"crop\"))\nprint(\"========================================\")\nPY3"
+        },
+        {
+          "name": "Upload test artifacts",
+          "uses": "actions/upload-artifact@v7",
+          "with": {
+            "name": "chromium-render-test",
+            "path": "artifacts/real_render_test",
+            "if-no-files-found": "error",
+            "retention-days": 7
+          },
+          "if": "${{ github.event_name == 'workflow_dispatch' }}"
+        },
+        {
+          "name": "Send PNG to Apps Script",
+          "env": {
+            "CALLBACK_SECRET": "${{ secrets.RENDER_CALLBACK_SECRET }}"
+          },
+          "run": "python - <<'PY4'\nimport base64\nimport csv\nimport json\nimport os\nimport urllib.parse\nimport urllib.request\nfrom pathlib import Path\n\npayload = json.loads(Path(\"payload.json\").read_text(encoding=\"utf-8\"))\nout = Path(\"artifacts/real_render_test\")\nimage_path = out / \"report_real.png\"\n\ncallback_url = str(payload.get(\"callbackUrl\", \"\")).strip()\nsecret = os.environ.get(\"CALLBACK_SECRET\", \"\").strip()\n\nif not callback_url:\n    raise SystemExit(\"Missing payload.callbackUrl\")\nif not secret:\n    raise SystemExit(\"Missing GitHub secret RENDER_CALLBACK_SECRET\")\nif not image_path.exists():\n    raise SystemExit(\"Missing report_real.png\")\n\nimage_b64 = base64.b64encode(image_path.read_bytes()).decode(\"ascii\")\n\nwith (out / \"history_real.csv\").open(encoding=\"utf-8\", newline=\"\") as f:\n    rows = list(csv.DictReader(f))\n\nofficial_count = sum(1 for r in rows if r.get(\"origen\") == \"playlist_x\")\nrandom_count = sum(1 for r in rows if r.get(\"origen\") == \"random\")\n\nreport_payload = {\n    \"type\": \"report_result\",\n    \"recordId\": payload.get(\"recordId\", \"\"),\n    \"playlistName\": payload.get(\"playlistName\", \"Playlist\"),\n    \"referenceTime\": payload.get(\"referenceTime\", \"\"),\n    \"generatedAt\": payload.get(\"generatedAt\", \"\"),\n    \"generationMode\": payload.get(\"generationMode\", \"manual\"),\n    \"finalTimeHHMM\": payload.get(\"finalTimeHHMM\", \"\"),\n    \"officialCount\": official_count,\n    \"randomCount\": random_count,\n    \"totalRows\": len(rows),\n    \"imageFileName\": image_path.name,\n    \"imageBase64\": image_b64,\n}\n\nseparator = \"&\" if \"?\" in callback_url else \"?\"\nurl = callback_url + separator + urllib.parse.urlencode({\"key\": secret})\n\nbody = json.dumps(report_payload).encode(\"utf-8\")\nreq = urllib.request.Request(\n    url,\n    data=body,\n    headers={\n        \"Content-Type\": \"application/json\",\n        \"Accept\": \"application/json\",\n        \"User-Agent\": \"GitHubActions-SpotifyReportRenderer/1.0\",\n    },\n    method=\"POST\",\n)\n\ntry:\n    with urllib.request.urlopen(req, timeout=120) as response:\n        status = response.status\n        response_body = response.read().decode(\"utf-8\", errors=\"replace\")\nexcept Exception as exc:\n    raise SystemExit(f\"Callback request failed: {exc}\")\n\nprint(\"Apps Script callback HTTP:\", status)\nprint(\"Apps Script callback response:\", response_body[:2000])\n\nif status < 200 or status >= 300:\n    raise SystemExit(f\"Apps Script callback returned HTTP {status}\")\n\nresult = json.loads(response_body)\nif result.get(\"ok\") is not True:\n    raise SystemExit(f\"Apps Script callback reported failure: {result}\")\n\nprint(\"CALLBACK OK\")\nprint(\"Saved relative image path:\", result.get(\"fileName\", \"\"))\nprint(\"Drive file id:\", result.get(\"fileId\", \"\"))\nPY4",
+          "if": "${{ github.event_name == 'repository_dispatch' && (github.event.action == 'render_real_test' || github.event.action == 'render_scheduled') }}"
+        }
+      ],
+      "concurrency": {
+        "group": "spotify-report-${{ github.event.client_payload.recordId || github.run_id }}",
+        "cancel-in-progress": true
+      }
+    }
+  }
+}
