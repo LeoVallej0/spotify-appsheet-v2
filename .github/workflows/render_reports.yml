@@ -170,7 +170,11 @@ jobs:
                   image = source_image.convert('RGB')
                   assert image.width == expected_width, f'{filename}: ancho {image.width}; esperado {expected_width}'
                   assert image.height == expected_height, f'{filename}: alto {image.height}; esperado {expected_height}'
-                  assert 1 <= image.height <= full_height, f'{filename}: alto no válido {image.height}'
+                  # V16 permite que la última parte tenga altura dinámica,
+                  # incluso mayor que partSize[1]. partHeights ya valida su
+                  # altura exacta contra el manifiesto; solo las partes no
+                  # finales deben medir exactamente la altura completa.
+                  assert image.height > 0, f'{filename}: alto no válido {image.height}'
                   if index < len(part_files) - 1:
                       assert image.height == full_height, f'{filename}: una parte no final debe medir {full_height}px de alto'
                   assert ImageChops.difference(image, Image.new('RGB', image.size, 'white')).getbbox() is not None, f'{filename} está totalmente en blanco'
